@@ -9,13 +9,14 @@
 #include <HX711.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
 #include <math.h>
 #include <Arduino.h>
 
 // ---- Config ----
 const char* WIFI_SSID = "Hotspot";
 const char* WIFI_PASS = "12345678";  // Wi-Fi credentials for the ESP32 to connect to the distributor's hotspot
-const char* API_URL   = "http://10.116.145.217:8000/api/node.php";  // IP of the PC running start-demo.bat
+const char* API_URL   = "http://10.239.229.217:8000/api/node.php";  // IP of the PC running start-demo.bat
 const char* NODE_KEY  = "5bccdc8d88e34a3c9ba8efc9";               // tbl_node.node_key for this shop (PDS 1201)
 
 // ---- Pins ----
@@ -28,8 +29,9 @@ const int LCD_SDA = 21, LCD_SCL = 22;      // I2C 16x2 LCD (ESP32 default I2C pi
 const int BTN_NEXT = 13, BTN_STOP = 14;    // latching switches to GND; NEXT = dispense next item, STOP = end/skip
 
 // ---- Calibration (tune on the real machine) ----
-#define CALIBRATE 0                          // 1 = print raw scale readings to find SCALE_FACTOR
-float SCALE_FACTOR = 420.0;                  // raw units per gram: put a known weight on, factor = raw / grams
+#define CALIBRATE 0                      // 1 = calibrate with CAL_WEIGHT_G at boot, then show live weight (STOP switch = recalibrate)
+const float CAL_WEIGHT_G = 100;              // known weight used for calibration
+float SCALE_FACTOR = -420.0;                 // raw units per gram; only used until a calibration is saved to flash
 const float STOP_EARLY_G[3] = {25, 25, 15};  // grams still falling after the motor stops (auger coast), per hopper
 const unsigned long ITEM_TIMEOUT_MS = 60000; // hopper empty/jammed: stop and bill only what was given
 const unsigned long POLL_MS = 1000;
@@ -121,25 +123,31 @@ bool enroll(int slot) {
 // Run one feeder motor until the bin gains `target` grams; returns grams actually given.
 // ponytail: on/off control. Add PWM ramp-down near target if auger overshoot can't be tuned out with STOP_EARLY_G.
 float dispenseItem(int h, long target) {
-  scale.tare(10);
+  // HX711 read() blocks forever if the chip stops answering, so every read is guarded.
+  if (!scale.wait_ready_timeout(1000)) { Serial.println("HX711 not responding"); lcd2("Scale error", "Check HX711"); delay(2000); return 0; }
+  scale.set_offset(scale.read_median(15));  // tare() averages, so one spike skews zero
   syncButtons();
   digitalWrite(HOPPER_PINS[h], HIGH);  // motor run
   unsigned long t0 = millis(), lastLcd = 0;
+  float w = 0;
   // STOP button stops the motor early and bills only what was given.
   for (;;) {
-    float w = scale.get_units(1);
-    if (w >= target - STOP_EARLY_G[h] || millis() - t0 >= ITEM_TIMEOUT_MS || flipped(BTN_STOP, lastStop)) break;
+    bool ok = scale.wait_ready_timeout(500);
+    if (ok) w = scale.get_units(3);  // median of 3: one spike can't stop the motor early
+    else Serial.println("HX711 lost, stopping motor");
+    if (!ok || w >= target - STOP_EARLY_G[h] || millis() - t0 >= ITEM_TIMEOUT_MS || flipped(BTN_STOP, lastStop)) break;
     if (millis() - lastLcd >= 250) {  // live weight on line 2; throttled, I2C writes are slow
       lastLcd = millis();
-      char l2[17]; snprintf(l2, sizeof(l2), "%4ld/%ldg      ", lround(w > 0 ? w : 0), target);
+      char l2[17]; snprintf(l2, sizeof(l2), "%.2f/%.2fkg     ", (w > 0 ? w : 0) / 1000, target / 1000.0);
       lcd.setCursor(0, 1); lcd.print(l2);
+      Serial.printf("Hopper %d: %.3f / %.3f kg\n", h, w / 1000, target / 1000.0);
     }
     delay(5);
   }
   digitalWrite(HOPPER_PINS[h], LOW);   // motor stop
   delay(1500);  // let the grain settle before the final reading
-  float got = scale.get_units(10);
-  Serial.printf("Hopper %d: target %ld g, gave %.0f g\n", h, target, got);
+  float got = scale.wait_ready_timeout(1000) ? scale.get_units(10) : w;  // scale dead: bill last good reading
+  Serial.printf("Hopper %d: target %.3f kg, gave %.3f kg\n", h, target / 1000.0, got / 1000);
   return got > 0 ? got : 0;
 }
 
@@ -169,13 +177,13 @@ void poll() {
     for (int h = 0; h < 3; h++) {
       long target = res["grams"][h] | 0;
       if (target <= 0 || ended) { grams.add(0); continue; }
-      char l2[17]; snprintf(l2, sizeof(l2), "%ldg NEXT or STOP", target);
+      char l2[17]; snprintf(l2, sizeof(l2), "%.2fkg NEXT/STOP", target / 1000.0);
       lcd2(HOPPER_NAME[h], l2);
       if (!waitButton()) { ended = true; grams.add(0); continue; }  // STOP skips the rest
       lcd2(HOPPER_NAME[h], "Dispensing...");
       long got = lround(dispenseItem(h, target));
       grams.add(got);
-      snprintf(l2, sizeof(l2), "gave %ld g", got);
+      snprintf(l2, sizeof(l2), "gave %.2f kg", got / 1000.0);
       lcd2(HOPPER_NAME[h], l2);
     }
     report(done);
@@ -217,6 +225,25 @@ void identify(int id) {
   delay(2000);  // don't re-send while the finger is still on the sensor
 }
 
+// Tare, wait for the known weight, save raw-per-gram to flash. Sign comes out right however the cell is wired.
+void calibrate() {
+  lcd2("Calibrating...", "Keep plate empty");
+  delay(2000);
+  scale.set_offset(scale.read_median(15));
+  char l1[17]; snprintf(l1, sizeof(l1), "Put %.0fg & wait", CAL_WEIGHT_G);
+  lcd2(l1, "");
+  while (fabs(scale.read_median(5) - scale.get_offset()) < 1000) delay(50);  // weight placed
+  lcd2("Please wait...", "");
+  delay(2000);  // let the plate stop swinging
+  SCALE_FACTOR = (scale.read_median(15) - scale.get_offset()) / CAL_WEIGHT_G;
+  scale.set_scale(SCALE_FACTOR);
+  Preferences p; p.begin("scale"); p.putFloat("factor", SCALE_FACTOR); p.end();
+  Serial.printf("Calibrated: SCALE_FACTOR = %.2f (saved)\n", SCALE_FACTOR);
+  lcd2("Calibrated", "Remove weight");
+  delay(2000);
+  syncButtons();
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(LED, OUTPUT);
@@ -230,9 +257,12 @@ void setup() {
     pinMode(HOPPER_PINS[h], OUTPUT);
     digitalWrite(HOPPER_PINS[h], LOW);  // motor off
   }
-  scale.begin(HX_DT, HX_SCK);
-  scale.set_scale(CALIBRATE ? 1.0 : SCALE_FACTOR);
-  scale.tare(20);
+  scale.begin(HX_DT, HX_SCK, true);  // fastProcessor: ESP32 clocks SCK too fast for HX711 otherwise
+  scale.set_median_mode();  // reading spikes wreck an average; median drops them
+  Preferences p; p.begin("scale", true); SCALE_FACTOR = p.getFloat("factor", SCALE_FACTOR); p.end();
+  scale.set_scale(SCALE_FACTOR);
+  if (scale.wait_ready_timeout(2000)) { if (CALIBRATE) calibrate(); else scale.set_offset(scale.read_median(15)); }
+  else { Serial.println("HX711 not responding! Check DT/SCK/VCC."); lcd2("Scale error", "Check HX711"); delay(2000); }
 
   fpSerial.begin(57600, SERIAL_8N1, FP_RX, FP_TX);
   delay(100);
@@ -250,8 +280,16 @@ void setup() {
 
 void loop() {
 #if CALIBRATE
-  Serial.printf("raw: %.0f\n", scale.get_units(10));
-  delay(500);
+  if (scale.wait_ready_timeout(1000)) {
+    float g = scale.get_units(5);
+    Serial.printf("weight: %.0f g\n", g);
+    char l2[17]; snprintf(l2, sizeof(l2), "%-15.0fg", g);  // padded so old digits get overwritten
+    lcd.setCursor(0, 0); lcd.print("Weight          ");
+    lcd.setCursor(0, 1); lcd.print(l2);
+  }
+  else { Serial.println("HX711 not responding"); lcd2("Scale error", "Check HX711"); }
+  if (flipped(BTN_STOP, lastStop)) calibrate();
+  delay(100);
   return;
 #endif
   digitalWrite(LED, WiFi.status() == WL_CONNECTED);  // solid ON = connected & ready; off if Wi-Fi drops
